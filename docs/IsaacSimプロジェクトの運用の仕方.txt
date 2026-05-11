@@ -1,0 +1,4 @@
+Isaac SimをGitHubで管理する方法書いときます。
+data/enviromentsの中にあるmain.usdがメインシーンです。
+data/assetsの中にはrobot.usdやfield.usdみたいに個別のオブジェクトなどを保存しましょう。
+最後にmain.usdでadd refrence見たいのからaseetsの中身を統合して最終的なシュミレーションを作成します。
