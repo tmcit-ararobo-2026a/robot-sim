@@ -3,14 +3,6 @@ from isaacsim import SimulationApp
 
 simulation_app = SimulationApp({"headless": False})
 
-# 2. SimulationApp 起動後に自作ライブラリのパスを追加
-import sys
-import os
-
-lidar_path = os.path.expanduser("~/ws/OmniPerception/LidarSensor")
-if lidar_path not in sys.path:
-    sys.path.append(lidar_path)  # insert(0) ではなく append を使用
-
 # 3. ここで自作モジュールをインポート
 from LidarSensor.lidar_sensor import LidarSensor
 from LidarSensor.sensor_config.lidar_sensor_config import LidarConfig, LidarType
