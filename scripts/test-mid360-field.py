@@ -22,66 +22,43 @@ from isaacsim.util.debug_draw import _debug_draw
 # 1. USD ステージを開く / field.usd をロード
 # ---------------------------------------------------------
 usd_context = omni.usd.get_context()
-usd_context.new_stage()  # 新しい空ステージを作成（デフォルトで Z-Up）
+usd_context.new_stage()
 
 stage = usd_context.get_stage()
 
-# ステージの UpAxis を明確に Z-Up に設定
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
-UsdGeom.SetStageMetersPerUnit(stage, 1.0)  # 単位をmに統一
+UsdGeom.SetStageMetersPerUnit(stage, 1.0)
 
 dome_light = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
-dome_light.CreateIntensityAttr(1000.0)  # 明るさを設定
+dome_light.CreateIntensityAttr(1000.0)
 
-# field.usd の絶対パス
 usd_path = os.path.abspath("data/assets/2026field/2026field.usd")
 
-# /World/FieldPrim として field.usd を Reference 読み込み
 field_prim = stage.DefinePrim("/World/FieldPrim", "Xform")
 field_prim.GetReferences().AddReference(usd_path)
 
-# もし field.usd 自体が Y-Up で作られている場合、X軸周りに 90 度回転させて Z-Up に起こす
-# (pxr の UsdGeomXformCommonAPI を利用)
-xform_api = UsdGeom.XformCommonAPI(field_prim)
-# xform_api.SetRotate((0.0, 0.0, 0.0), UsdGeom.XformCommonAPI.RotationOrderXYZ)
-# 
-# field_scale = 1.0
-# xform_api.SetScale((field_scale, field_scale, field_scale))
-
-# 参照の非同期ロードを確実に完了させるため数ステップ更新
 for _ in range(10):
     simulation_app.update()
 
-import omni.kit.viewport.utility as vp_utils
-from pxr import UsdGeom, Gf
-
-# # 1. カスタムカメラの作成
-# camera_path = "/World/TestCamera"
-# camera_prim = UsdGeom.Camera.Define(stage, camera_path)
-# 
-# # カメラの位置（Eye）と向き（LookAt: 原点方向）を設定
-# # X=0, Y=-14m, Z=10m から斜め下を見下ろす設定
-# xform_api = UsdGeom.XformCommonAPI(camera_prim)
-# xform_api.SetTranslate((10.0, -14.0, 12.0))
-# xform_api.SetRotate((25.0, 0.0, 30.0), UsdGeom.XformCommonAPI.RotationOrderXYZ)
-# 
-# # 2. Viewport のアクティブカメラに指定
-# active_viewport = vp_utils.get_active_viewport()
-# if active_viewport:
-#     active_viewport.camera_path = camera_path
-
 # ---------------------------------------------------------
-# 2. USD メッシュから Warp Mesh を作成する関数 (行列適用・正確版)
+# 2. USD メッシュから Warp Mesh を作成 & 更新する機能
 # ---------------------------------------------------------
+warp_mesh_data = {
+    'wp_mesh': None,
+    'wp_pts': None,
+    'wp_idx': None,
+    'mesh_prims': []
+}
+
 def create_warp_mesh_from_usd():
     all_vertices = []
     all_indices = []
     index_offset = 0
+    mesh_prims = []
 
     for prim in stage.Traverse():
         if prim.IsA(UsdGeom.Mesh):
             mesh_geom = UsdGeom.Mesh(prim)
-            
             points = mesh_geom.GetPointsAttr().Get()
             face_indices = mesh_geom.GetFaceVertexIndicesAttr().Get()
             face_counts = mesh_geom.GetFaceVertexCountsAttr().Get()
@@ -95,7 +72,6 @@ def create_warp_mesh_from_usd():
             if len(pts_np) == 0 or len(indices_np) == 0:
                 continue
 
-            # N角形ポリゴンを三角形に分割
             tri_indices = []
             curr_idx = 0
             for count in face_counts:
@@ -107,57 +83,83 @@ def create_warp_mesh_from_usd():
 
             tri_indices_np = np.array(tri_indices, dtype=np.int32)
 
-            # --- ワールド変換行列の正確な適用 ---
-            # USD の Gf.Matrix4d は row-major なので (N, 4) @ (4, 4) でそのままワールド座標になる
             transform = mesh_geom.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-            transform_matrix = np.array(transform, dtype=np.float32) # (4, 4)
+            transform_matrix = np.array(transform, dtype=np.float32)
 
             pts_homo = np.hstack([pts_np, np.ones((len(pts_np), 1), dtype=np.float32)])
-            # (N, 4) @ (4, 4) で各頂点にワールド変換（回転・スケール・平行移動）を正しく適用
             pts_transformed = (pts_homo @ transform_matrix)[:, :3]
 
             all_vertices.append(pts_transformed)
             all_indices.append(tri_indices_np + index_offset)
             index_offset += len(pts_transformed)
-
-    if not all_vertices:
-        raise RuntimeError("No valid UsdGeom.Mesh found in the stage!")
+            
+            mesh_prims.append((mesh_geom, pts_homo))
 
     merged_vertices = np.vstack(all_vertices).astype(np.float32)
     merged_indices = np.concatenate(all_indices).astype(np.int32)
 
-    # Bounds 出力による検証
-    x_min, y_min, z_min = merged_vertices.min(axis=0)
-    x_max, y_max, z_max = merged_vertices.max(axis=0)
-    
-    print("=" * 60)
-    print(f"[DEBUG] Final Synchronized Bounds:")
-    print(f"        X: {x_min:.3f} m ~ {x_max:.3f} m (Width: {x_max - x_min:.3f} m)")
-    print(f"        Y: {y_min:.3f} m ~ {y_max:.3f} m (Depth: {y_max - y_min:.3f} m)")
-    print(f"        Z: {z_min:.3f} m ~ {z_max:.3f} m (Height: {z_max - z_min:.3f} m)")
-    print("=" * 60)
-
-    # Warp Mesh の構築
     wp_pts = wp.array(merged_vertices, dtype=wp.vec3, device='cuda:0')
     wp_idx = wp.array(merged_indices, dtype=int, device='cuda:0')
 
-    return wp.Mesh(points=wp_pts, indices=wp_idx)
+    # 【修正】support_refit キーワード引数を削除
+    wp_mesh = wp.Mesh(points=wp_pts, indices=wp_idx)
+
+    warp_mesh_data['wp_mesh'] = wp_mesh
+    warp_mesh_data['wp_pts'] = wp_pts
+    warp_mesh_data['wp_idx'] = wp_idx
+    warp_mesh_data['mesh_prims'] = mesh_prims
+
+    return wp_mesh
+
+def update_warp_mesh_transforms():
+    """USD上の物体移動に合わせて既存の Warp Mesh 頂点を更新し refit() する"""
+    all_transformed_pts = []
+    
+    timeline = omni.timeline.get_timeline_interface()
+    current_time_sec = timeline.get_current_time()
+    fps = stage.GetTimeCodesPerSecond()
+    time_code = Usd.TimeCode(current_time_sec * fps)
+
+    for mesh_geom, cached_pts_homo in warp_mesh_data['mesh_prims']:
+        points = mesh_geom.GetPointsAttr().Get(time_code)
+        if points is None or len(points) == 0:
+            points = mesh_geom.GetPointsAttr().Get(Usd.TimeCode.Default())
+        
+        if points is not None and len(points) > 0:
+            pts_np = np.array(points, dtype=np.float32)
+            pts_homo = np.hstack([pts_np, np.ones((len(pts_np), 1), dtype=np.float32)])
+        else:
+            pts_homo = cached_pts_homo
+
+        transform = mesh_geom.ComputeLocalToWorldTransform(time_code)
+        transform_matrix = np.array(transform, dtype=np.float32)
+
+        pts_transformed = (pts_homo @ transform_matrix)[:, :3]
+        all_transformed_pts.append(pts_transformed)
+
+    if not all_transformed_pts:
+        return
+
+    updated_vertices = np.vstack(all_transformed_pts).astype(np.float32)
+
+    # 既存の wp.array に書き込み後、refit() を呼ぶ
+    new_pts_wp = wp.array(updated_vertices, dtype=wp.vec3, device='cuda:0')
+    wp.copy(warp_mesh_data['wp_pts'], new_pts_wp)
+    warp_mesh_data['wp_mesh'].refit()
 
 # メッシュの初期化
 field_warp_mesh = create_warp_mesh_from_usd()
 print(f"[INFO] Field Warp Mesh created. ID: {field_warp_mesh.id}")
 
 # ---------------------------------------------------------
-# 3. LidarSensor のセットアップ & 描画ループ修正
+# 3. LidarSensor のセットアップ & 描画ループ
 # ---------------------------------------------------------
 num_envs = 1
 num_sensors = 1
 
 mesh_ids_array = wp.array([field_warp_mesh.id], dtype=wp.uint64, device='cuda:0')
 
-# センサー位置を X=1.0, Y=0.0, Z=0.5m など分かりやすい高さに設定
 sensor_pos = torch.tensor([[1.0, 0.0, 0.5]], device='cuda:0')
-# クウォータニオン: [x, y, z, w] -> 単位クウォータニオン (回転なし)
 sensor_quat = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]], device='cuda:0')
 
 dummy_env = {
@@ -185,33 +187,37 @@ timeline = omni.timeline.get_timeline_interface()
 timeline.play()
 
 draw = _debug_draw.acquire_debug_draw_interface()
-sensor_pos_np = sensor_pos[0].cpu().numpy()
 
+# メインループ
 for i in range(2000):
     simulation_app.update()
-    
+
+    # 1. Mesh 頂点を更新して refit()（Mesh ID は変えず BVH のみ更新）
+    update_warp_mesh_transforms()
+
+    # 2. LiDAR Raycast 実行
     points_tensor, dist_tensor = lidar.update()
     
-    # テンソルを numpy 配列へ変換
     pts = points_tensor.detach().cpu().numpy().reshape(-1, 3)
 
-    # 有効点抽出
     valid_mask = ~np.isnan(pts).any(axis=1) & (np.linalg.norm(pts, axis=1) > 0.01)
     pts_valid = pts[valid_mask]
 
-    if len(pts_valid) > 0:
-        if i == 0:
-            print(f"[DEBUG] Total Valid Points: {len(pts_valid)}")
-            print(f"[DEBUG] Raw Point 0: {pts_valid[0]}")
+    # デバッグ出力（Raw Lidar Output Mean が Mesh Center と連動するか確認）
+    if len(pts_valid) > 0 and i % 50 == 0:
+        current_wp_pts = warp_mesh_data['wp_pts'].numpy()
+        mesh_center = current_wp_pts.mean(axis=0)
+        raw_mean = pts_valid.mean(axis=0)
+        print(f"[Frame {i:04d}] Mesh Center (World): {mesh_center} | Raw Lidar Output Mean: {raw_mean}")
 
-        # --- 重要: 判定の条件分岐を排除 ---
-        # LidarSensor クラスは「センサー原点のローカル座標」で点群を返す仕様です。
-        # そのため、ワールドに描画する場合は一律で sensor_pos を加算します。
-        draw_pts = pts_valid + sensor_pos_np
+    # 描画処理
+    if len(pts_valid) > 0:
+        current_sensor_pos = dummy_env['sensor_pos_tensor'][0].cpu().numpy()
+        draw_pts = pts_valid + current_sensor_pos
 
         draw.clear_points()
         points_list = [tuple(p) for p in draw_pts]
         sizes = [3.0] * len(points_list)
-        colors = [(1.0, 0.0, 0.0, 1.0)] * len(points_list)  # 赤
+        colors = [(1.0, 0.0, 0.0, 1.0)] * len(points_list)
         
         draw.draw_points(points_list, colors, sizes)
