@@ -13,7 +13,8 @@ from isaacsim import SimulationApp
 streaming_kit = isaac_sim_path / "apps" / "isaacsim.exp.full.streaming.kit"
 
 simulation_app = SimulationApp({
-    "headless": False,
+    "headless": True,
+    "experience": str(streaming_kit),
 })
 
 import omni.kit.app
