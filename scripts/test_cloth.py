@@ -1,7 +1,7 @@
-# ClothLauncher Script Node (完全状態リセット・重複発射防止版)
+# ClothLauncher Script Node (execIn トリガー連動・1枚ずつ確実に射出する完全版)
 import numpy as np
 from collections import deque
-from pxr import Usd, UsdGeom, Gf
+from pxr import Usd, UsdGeom, Gf, Vt, Sdf
 from isaacsim.core.utils.prims import is_prim_path_valid
 import omni.usd
 
@@ -13,80 +13,89 @@ def _is_valid_quat(q):
     return np.isfinite(n) and n > 1e-6
 
 def _quat_rotate(quat_wxyz, vec):
+    """四元数(w,x,y,z)でベクトルをワールド座標へ回転"""
     w, x, y, z = quat_wxyz
     q_vec = np.array([x, y, z])
     uv = np.cross(q_vec, vec)
     uuv = np.cross(q_vec, uv)
     return vec + 2.0 * (uv * w + uuv)
 
+def _extract_prim_path_string(input_val):
+    if not input_val:
+        return ""
+    if isinstance(input_val, (list, tuple, np.ndarray)):
+        if len(input_val) == 0:
+            return ""
+        val = input_val[0]
+    else:
+        val = input_val
+    
+    if isinstance(val, Sdf.Path):
+        return val.pathString
+    return str(val)
+
 def setup(db):
     state = db.internal_state
     stage = omni.usd.get_context().get_stage()
     state.stage = stage
-    
-    # シミュレーション開始時に状態を完全に初期化（過去の送信記録を消去）
-    state.has_fired_for_current_msg = True  # Play直後の誤発火を防止
-    state.last_raw_vel = None
 
-    pool_root = db.inputs.poolRootPrim
-    if not pool_root:
-        db.log_error("[ClothLauncher] poolRootPrim is empty")
+    raw_root_path = _extract_prim_path_string(db.inputs.poolRootPrim)
+    if not raw_root_path:
+        db.log_error("[ClothLauncher] poolRootPrim is empty or invalid")
         return True
-    pool_root_path = str(pool_root[0])
+    
+    root_path = raw_root_path.rstrip('/')
     pool_size = int(db.inputs.poolSize)
 
     state.available = deque()
 
     for i in range(pool_size):
-        path = f"{pool_root_path}/marker_{i:02d}"
+        path = f"{root_path}/marker_{i:02d}"
         if not is_prim_path_valid(path):
-            db.log_warning(f"[ClothLauncher] marker prim not found: {path}")
             continue
+        
+        marker_prim = stage.GetPrimAtPath(path)
+        
+        # 初期状態は物理停止
+        if marker_prim.HasAPI("PhysxDeformableBodyAPI"):
+            attr = marker_prim.GetAttribute("physxDeformable:deformableBodyEnabled")
+            if attr:
+                attr.Set(False)
+        
         state.available.append(path)
 
-    db.log_info(f"[ClothLauncher] pool ready: {len(state.available)} markers")
+    db.log_info(f"[ClothLauncher] Pool initialized. Total available: {len(state.available)}")
 
 def compute(db):
+    # execIn 入力がアタッチされている場合、実行シグナルが来ていなければ即リターン
+    if hasattr(db.inputs, "execIn") and not db.inputs.execIn:
+        return True
+
     state = db.internal_state
-    stage = state.stage
+    stage = getattr(state, "stage", None)
+    if stage is None:
+        stage = omni.usd.get_context().get_stage()
+        state.stage = stage
 
     local_lin_vel = np.array([db.inputs.linearVelocity[0], db.inputs.linearVelocity[1], db.inputs.linearVelocity[2]], dtype=np.float64)
-    local_ang_vel = np.array([db.inputs.angularVelocity[0], db.inputs.angularVelocity[1], db.inputs.angularVelocity[2]], dtype=np.float64)
 
-    current_vel_tuple = (round(local_lin_vel[0], 3), round(local_lin_vel[1], 3), round(local_lin_vel[2], 3))
-
-    # 速度がほぼ 0 の場合はリセットして終了
-    if np.linalg.norm(local_lin_vel) < 1e-3 and np.linalg.norm(local_ang_vel) < 1e-3:
-        state.has_fired_for_current_msg = False
-        state.last_raw_vel = current_vel_tuple
+    if not hasattr(state, "available") or not state.available:
+        db.log_warning("[ClothLauncher] pool exhausted!")
         return True
 
-    # 同じメッセージがバッファに残っている場合のチェック
-    if state.last_raw_vel == current_vel_tuple:
-        if state.has_fired_for_current_msg:
-            return True
-    else:
-        # 新しい値が届いたときのみ新規発射を許可
-        state.last_raw_vel = current_vel_tuple
-        state.has_fired_for_current_msg = False
-
-    # プール残数チェック
-    if not state.available:
-        db.log_warning(f"[ClothLauncher] pool exhausted (remaining: {len(state.available)})")
+    release_path_str = _extract_prim_path_string(db.inputs.releasePointPrim)
+    if not release_path_str:
         return True
 
-    # 発射基準点（ReleasePoint）の取得
-    release_prim_target = db.inputs.releasePointPrim
-    if not release_prim_target:
-        db.log_error("[ClothLauncher] releasePointPrim is empty")
-        return True
-    
-    release_prim = stage.GetPrimAtPath(str(release_prim_target[0]))
+    release_prim = stage.GetPrimAtPath(release_path_str)
     if not release_prim:
-        db.log_error(f"[ClothLauncher] releasePointPrim not found: {release_prim_target[0]}")
         return True
 
-    # 発射位置と姿勢の計算
+    # プールから 1 枚取り出し
+    marker_path = state.available.popleft()
+    marker_prim = stage.GetPrimAtPath(marker_path)
+
+    # 1. 射出位置のワールド座標・回転を取得
     xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     world_mat = xform_cache.GetLocalToWorldTransform(release_prim)
     world_mat.Orthonormalize()
@@ -102,30 +111,21 @@ def compute(db):
     ], dtype=np.float64)
 
     if not (_is_valid_vec(world_pos_np) and _is_valid_quat(quat_wxyz)):
-        db.log_warning(f"[ClothLauncher] invalid release pose, skip")
+        state.available.appendleft(marker_path)
         return True
-    quat_wxyz /= np.linalg.norm(quat_wxyz)
 
-    # 速度の変換（ローカル -> ワールド）
+    quat_wxyz = quat_wxyz / np.linalg.norm(quat_wxyz)
     world_lin_vel = _quat_rotate(quat_wxyz, local_lin_vel)
-    world_ang_vel = _quat_rotate(quat_wxyz, local_ang_vel)
 
-    if not (_is_valid_vec(world_lin_vel) and _is_valid_vec(world_ang_vel)):
-        db.log_warning(f"[ClothLauncher] invalid velocity, skip")
-        return True
-
-    # プールから1つ取り出し
-    marker_path = state.available.popleft()
-    marker_prim = stage.GetPrimAtPath(marker_path)
-
-    # USD Xformable で位置移動
+    # 2. ワープ移動（Transform設定）
     xformable = UsdGeom.Xformable(marker_prim)
+    xformable.SetResetXformStack(True)
     xformable.ClearXformOpOrder()
     rot_gf = Gf.Rotation(Gf.Quatd(quat_wxyz[0], quat_wxyz[1], quat_wxyz[2], quat_wxyz[3]))
-    transform_matrix = Gf.Matrix4d().SetTransform(rot_gf, Gf.Vec3d(*world_pos_np))
+    transform_matrix = Gf.Matrix4d().SetTransform(rot_gf, Gf.Vec3d(world_pos_np[0], world_pos_np[1], world_pos_np[2]))
     xformable.AddTransformOp().Set(transform_matrix)
 
-    # Cloth（simulation_mesh）の頂点へ速度を適用
+    # 3. メッシュ頂点速度の設定
     simulation_mesh_path = f"{marker_path}/simulation_mesh"
     simulation_mesh_prim = stage.GetPrimAtPath(simulation_mesh_path)
     if simulation_mesh_prim:
@@ -133,23 +133,15 @@ def compute(db):
         sim_points = simulation_mesh.GetPointsAttr().Get()
         if sim_points:
             num_points = len(sim_points)
-            velocities = np.empty((num_points, 3), dtype=np.float32)
-            velocities[:] = world_lin_vel
+            velocities = Vt.Vec3fArray([Gf.Vec3f(float(world_lin_vel[0]), float(world_lin_vel[1]), float(world_lin_vel[2]))] * num_points)
+            simulation_mesh.GetVelocitiesAttr().Set(velocities)
 
-            if np.linalg.norm(world_ang_vel) > 1e-6:
-                points_np = np.asarray([[p[0], p[1], p[2]] for p in sim_points], dtype=np.float64)
-                center = np.mean(points_np, axis=0)
-                r = points_np - center
-                velocities += np.cross(world_ang_vel, r).astype(np.float32)
-
-            sim_velocities_attr = simulation_mesh.GetVelocitiesAttr()
-            if sim_velocities_attr.IsValid():
-                sim_velocities_attr.Set([Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])) for v in velocities])
-
+    # 4. 可視化 ＆ 物理有効化
     UsdGeom.Imageable(marker_prim).MakeVisible()
-
-    # 発射完了フラグをセット
-    state.has_fired_for_current_msg = True
+    if marker_prim.HasAPI("PhysxDeformableBodyAPI"):
+        attr = marker_prim.GetAttribute("physxDeformable:deformableBodyEnabled")
+        if attr:
+            attr.Set(True)
 
     db.outputs.spawnedPrimPath = marker_path
     db.outputs.execOut = True
