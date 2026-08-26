@@ -1,4 +1,4 @@
-# ClothLauncher Script Node (reset 自動 False リセット機能付き)
+# ClothLauncher Script Node (コライダー再有効化・射出同期改善版)
 import numpy as np
 from collections import deque
 from pxr import Usd, UsdGeom, Gf, Vt, Sdf
@@ -14,7 +14,6 @@ def _is_valid_quat(q):
     return np.isfinite(n) and n > 1e-6
 
 def _quat_rotate(quat_wxyz, vec):
-    """四元数(w,x,y,z)でベクトルをワールド座標へ回転"""
     w, x, y, z = quat_wxyz
     q_vec = np.array([x, y, z])
     uv = np.cross(q_vec, vec)
@@ -35,35 +34,40 @@ def _extract_prim_path_string(input_val):
         return val.pathString
     return str(val)
 
-def _reset_single_marker(marker_path, stage, init_transform):
-    """単一の雑巾をデフォルトの位置・物理OFF・表示・速度ゼロに初期化"""
+def _reset_single_marker(marker_path, stage, init_transform, init_points):
+    """プール保管時：物理・コライダーをOFFにし、速度と形状を完全初期化"""
     if not is_prim_path_valid(marker_path):
         return
     
     marker_prim = stage.GetPrimAtPath(marker_path)
     
-    # 1. 物理シミュレーションを停止
+    # 1. Deformable Body（物理演算およびコライダー処理）をOFF
     if marker_prim.HasAPI("PhysxDeformableBodyAPI"):
         attr = marker_prim.GetAttribute("physxDeformable:deformableBodyEnabled")
         if attr:
             attr.Set(False)
     
-    # 2. 表示状態を固定
+    # 2. 非表示にする（保管中は隠す）
     imageable = UsdGeom.Imageable(marker_prim)
     if imageable:
-        imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+        imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.invisible)
     
-    # 3. デフォルト（元の位置・姿勢）に戻す
+    # 3. 親のTransformを元に戻す
     xformable = UsdGeom.Xformable(marker_prim)
     xformable.SetResetXformStack(True)
     xformable.ClearXformOpOrder()
     xformable.AddTransformOp().Set(init_transform)
 
-    # 4. 頂点速度のリセット
+    # 4. メッシュ頂点座標と速度を完全リセット
     simulation_mesh_path = f"{marker_path}/simulation_mesh"
     simulation_mesh_prim = stage.GetPrimAtPath(simulation_mesh_path)
     if simulation_mesh_prim:
         simulation_mesh = UsdGeom.Mesh(simulation_mesh_prim)
+        
+        # 変形した形状を初期状態に戻す
+        if marker_path in init_points and init_points[marker_path]:
+            simulation_mesh.GetPointsAttr().Set(init_points[marker_path])
+
         sim_points = simulation_mesh.GetPointsAttr().Get()
         if sim_points:
             num_points = len(sim_points)
@@ -71,14 +75,11 @@ def _reset_single_marker(marker_path, stage, init_transform):
             simulation_mesh.GetVelocitiesAttr().Set(zero_vels)
 
 def _reset_all_markers(state, stage):
-    """すべての雑巾を記憶しておいた「元の位置・デフォルト状態」に戻す"""
     state.available = deque()
-
     for path, init_transform in state.initial_transforms.items():
         if not is_prim_path_valid(path):
             continue
-        
-        _reset_single_marker(path, stage, init_transform)
+        _reset_single_marker(path, stage, init_transform, state.initial_points)
         state.available.append(path)
 
 def setup(db):
@@ -86,8 +87,8 @@ def setup(db):
     stage = omni.usd.get_context().get_stage()
     state.stage = stage
     state.initial_transforms = {}
+    state.initial_points = {}
 
-    # inputs:reset ポートが無ければ自動作成
     try:
         node = db.node
         if not node.get_attribute("inputs:reset").is_valid():
@@ -108,7 +109,6 @@ def setup(db):
     state.root_path = raw_root_path.rstrip('/')
     state.pool_size = int(db.inputs.poolSize)
 
-    # 各雑巾の「元の位置（デフォルトのTransform）」を取得して記録する
     for i in range(state.pool_size):
         path = f"{state.root_path}/marker_{i:02d}"
         if not is_prim_path_valid(path):
@@ -116,13 +116,16 @@ def setup(db):
         
         marker_prim = stage.GetPrimAtPath(path)
         xformable = UsdGeom.Xformable(marker_prim)
-        
-        local_transformation = xformable.GetLocalTransformation(Usd.TimeCode.Default())
-        state.initial_transforms[path] = local_transformation
+        state.initial_transforms[path] = xformable.GetLocalTransformation(Usd.TimeCode.Default())
 
-    # 全雑巾をデフォルト状態にリセット
+        # 初期頂点位置を保持
+        sim_mesh_prim = stage.GetPrimAtPath(f"{path}/simulation_mesh")
+        if sim_mesh_prim:
+            sim_mesh = UsdGeom.Mesh(sim_mesh_prim)
+            state.initial_points[path] = sim_mesh.GetPointsAttr().Get()
+
     _reset_all_markers(state, stage)
-    db.log_info(f"[ClothLauncher] Pool initialized and default transforms saved. Total: {len(state.available)}")
+    return True
 
 def compute(db):
     state = db.internal_state
@@ -131,26 +134,22 @@ def compute(db):
         stage = omni.usd.get_context().get_stage()
         state.stage = stage
 
-    # --- リセット処理 (reset == True の場合) ---
+    # --- リセット処理 ---
     is_reset = False
     if hasattr(db.inputs, "reset"):
         is_reset = bool(db.inputs.reset)
 
     if is_reset:
         _reset_all_markers(state, stage)
-        
-        # ★ reset 入力を即座に False へ書き戻す処理
         try:
             reset_attr = db.node.get_attribute("inputs:reset")
             if reset_attr and reset_attr.is_valid():
                 reset_attr.set(False)
         except Exception as e:
             db.log_warning(f"[ClothLauncher] Could not reset input attribute: {e}")
-
-        db.log_info("[ClothLauncher] Reset executed and 'reset' attribute toggled back to False.")
         return True
 
-    # --- 通常の射出処理 (execIn トリガー) ---
+    # --- 射出処理 ---
     if hasattr(db.inputs, "execIn") and not db.inputs.execIn:
         return True
 
@@ -168,11 +167,10 @@ def compute(db):
 
     local_lin_vel = np.array([db.inputs.linearVelocity[0], db.inputs.linearVelocity[1], db.inputs.linearVelocity[2]], dtype=np.float64)
 
-    # プールから 1 枚取り出し
     marker_path = state.available.popleft()
     marker_prim = stage.GetPrimAtPath(marker_path)
 
-    # 1. 射出位置のワールド座標・回転を取得
+    # 1. 射出位置（Cube）のワールド座標・回転の取得
     xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     world_mat = xform_cache.GetLocalToWorldTransform(release_prim)
     world_mat.Orthonormalize()
@@ -194,7 +192,7 @@ def compute(db):
     quat_wxyz = quat_wxyz / np.linalg.norm(quat_wxyz)
     world_lin_vel = _quat_rotate(quat_wxyz, local_lin_vel)
 
-    # 2. ワープ移動（射出位置へ移動）
+    # 2. 射出位置（Cube）へワープ移動
     xformable = UsdGeom.Xformable(marker_prim)
     xformable.SetResetXformStack(True)
     xformable.ClearXformOpOrder()
@@ -202,26 +200,32 @@ def compute(db):
     transform_matrix = Gf.Matrix4d().SetTransform(rot_gf, Gf.Vec3d(world_pos_np[0], world_pos_np[1], world_pos_np[2]))
     xformable.AddTransformOp().Set(transform_matrix)
 
-    # 3. メッシュ頂点速度の設定
+    # 3. 表示を復元
+    imageable = UsdGeom.Imageable(marker_prim)
+    if imageable:
+        imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+
+    # 4. 物理とコライダーを有効化（先に有効化）
+    if marker_prim.HasAPI("PhysxDeformableBodyAPI"):
+        attr = marker_prim.GetAttribute("physxDeformable:deformableBodyEnabled")
+        if attr:
+            attr.Set(True)
+
+    # 5. 物理有効化の「直後」に頂点速度を注入（上書きリセットを防止）
     simulation_mesh_path = f"{marker_path}/simulation_mesh"
     simulation_mesh_prim = stage.GetPrimAtPath(simulation_mesh_path)
     if simulation_mesh_prim:
         simulation_mesh = UsdGeom.Mesh(simulation_mesh_prim)
+        
+        # メッシュの形状をリセット
+        if marker_path in state.initial_points and state.initial_points[marker_path]:
+            simulation_mesh.GetPointsAttr().Set(state.initial_points[marker_path])
+
         sim_points = simulation_mesh.GetPointsAttr().Get()
         if sim_points:
             num_points = len(sim_points)
             velocities = Vt.Vec3fArray([Gf.Vec3f(float(world_lin_vel[0]), float(world_lin_vel[1]), float(world_lin_vel[2]))] * num_points)
             simulation_mesh.GetVelocitiesAttr().Set(velocities)
-
-    # 4. 可視化 ＆ 物理有効化
-    imageable = UsdGeom.Imageable(marker_prim)
-    if imageable:
-        imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
-
-    if marker_prim.HasAPI("PhysxDeformableBodyAPI"):
-        attr = marker_prim.GetAttribute("physxDeformable:deformableBodyEnabled")
-        if attr:
-            attr.Set(True)
 
     db.outputs.spawnedPrimPath = marker_path
     db.outputs.execOut = True
