@@ -215,6 +215,11 @@ def compute(db):
             velocities = Vt.Vec3fArray([Gf.Vec3f(float(world_lin_vel[0]), float(world_lin_vel[1]), float(world_lin_vel[2]))] * num_points)
             simulation_mesh.GetVelocitiesAttr().Set(velocities)
 
+ # スポーン成功時の処理の最後あたりに追加
+    world_pos_list = [float(world_pos_np[0]), float(world_pos_np[1]), float(world_pos_np[2])]
+    print(f"[ClothLauncher] Spawned {marker_path} at position: {world_pos_list}")
+
+    print(f"Release Prim Found: {bool(release_prim)}, Path: {release_path_str}")
     db.outputs.spawnedPrimPath = marker_path
     db.outputs.execOut = True
     return True
