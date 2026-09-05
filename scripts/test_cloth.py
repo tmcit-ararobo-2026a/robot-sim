@@ -1,10 +1,52 @@
 # ClothLauncher Script Node (World直下・起動時完全非表示対応版)
+# ClothLauncher Script Node (実機ベルト直動式射出機構・実測LUT対応版)
 import numpy as np
+import time
 from collections import deque
 from pxr import Usd, UsdGeom, Gf, Vt, Sdf
 from isaacsim.core.utils.prims import is_prim_path_valid
 import omni.usd
 import omni.graph.core as og
+
+# ==============================================================================
+# Kamagata0/shooter_calculator 実機実測データベース (LUT)
+# ベルト直動式射出機構の出力レベル(1〜10)・ベルト速度指令(0.1〜1.0 m/s) ↔ release velocity [m/s]
+# ==============================================================================
+MEASURED_LUT = [
+    # (level, speed_ratio, release_velocity, flight_distance)
+    (1,  0.1, 1.550000000, 0.000000000),
+    (2,  0.2, 2.296666667, 0.533333333),
+    (3,  0.3, 4.763333333, 2.666666667),
+    (4,  0.4, 5.953333333, 3.966666667),
+    (5,  0.5, 8.840000000, 3.566666667),
+    (6,  0.6, 11.23333333, 4.100000000),
+    (7,  0.7, 8.516666667, 3.333333333),
+    (8,  0.8, 9.040000000, 3.566666667),
+    (9,  0.9, 9.420000000, 3.833333333),
+    (10, 1.0, 10.84666667, 3.966666667),
+]
+
+DEFAULT_LAUNCH_ANGLE_DEG = 50.0  # 実機シューター射出仰角 [deg]
+
+def get_release_velocity_from_level(level):
+    """出力レベル (1.0〜10.0) から線形補間で release velocity [m/s] と推定飛距離 [m] を取得"""
+    if level <= MEASURED_LUT[0][0]:
+        return MEASURED_LUT[0][2], MEASURED_LUT[0][3]
+    if level >= MEASURED_LUT[-1][0]:
+        return MEASURED_LUT[-1][2], MEASURED_LUT[-1][3]
+    
+    for i in range(len(MEASURED_LUT) - 1):
+        l1, _, v1, d1 = MEASURED_LUT[i]
+        l2, _, v2, d2 = MEASURED_LUT[i + 1]
+        if l1 <= level <= l2:
+            t = (level - l1) / (l2 - l1)
+            return v1 + t * (v2 - v1), d1 + t * (d2 - d1)
+    return MEASURED_LUT[-1][2], MEASURED_LUT[-1][3]
+
+def get_release_velocity_from_speed_ratio(ratio):
+    """/belt/speed_ratio (0.1〜1.0 m/s) から線形補間で release velocity [m/s] を取得"""
+    level = ratio * 10.0
+    return get_release_velocity_from_level(level)
 
 def _is_valid_vec(v):
     return np.all(np.isfinite(v))
@@ -87,6 +129,7 @@ def setup(db):
     state.stage = stage
     state.initial_transforms = {}
     state.initial_points = {}
+    state.last_launch_time = 0.0
 
     try:
         node = db.node
@@ -99,6 +142,26 @@ def setup(db):
             )
     except Exception:
         pass
+    # OmniGraph属性の安全な作成（存在しない場合のみ作成）
+    def _ensure_attr(attr_name, base_type, custom_data=""):
+        try:
+            node = db.node
+            if not node.get_attribute(attr_name).is_valid():
+                node.create_attribute(
+                    attr_name,
+                    og.Type(base_type),
+                    custom_user_data=custom_data,
+                    port_type=og.AttributePortType.ATTRIBUTE_PORT_TYPE_INPUT
+                )
+        except Exception:
+            pass
+
+    _ensure_attr("inputs:reset", og.BaseDataType.BOOL, "bool input for resetting all cloths")
+    _ensure_attr("inputs:outputLevel", og.BaseDataType.FLOAT, "Shooter output level (1.0 to 10.0)")
+    _ensure_attr("inputs:speedRatio", og.BaseDataType.FLOAT, "Belt speed command ratio (0.1 to 1.0 m/s)")
+    _ensure_attr("inputs:launchAngleDeg", og.BaseDataType.FLOAT, "Shooter launch angle in degrees (default 50.0)")
+    _ensure_attr("inputs:cooldownTime", og.BaseDataType.FLOAT, "Cooldown interval between launches in seconds")
+    _ensure_attr("inputs:releaseVelocity", og.BaseDataType.FLOAT, "Direct release velocity override in m/s")
 
     # --- /World 直下から直接 marker_00 ~ を探索する設定 ---
     state.root_path = "/World"
@@ -147,6 +210,20 @@ def compute(db):
     if hasattr(db.inputs, "execIn") and not db.inputs.execIn:
         return True
 
+    # --- クールダウン処理（連射制限） ---
+    current_time = time.time()
+    cooldown = 0.5
+    if hasattr(db.inputs, "cooldownTime"):
+        try:
+            c_val = float(db.inputs.cooldownTime)
+            if c_val > 0.0:
+                cooldown = c_val
+        except Exception:
+            pass
+
+    if (current_time - getattr(state, "last_launch_time", 0.0)) < cooldown:
+        return True
+
     if not hasattr(state, "available") or not state.available:
         db.log_warning("[ClothLauncher] pool exhausted!")
         return True
@@ -160,6 +237,80 @@ def compute(db):
         return True
 
     local_lin_vel = np.array([db.inputs.linearVelocity[0], db.inputs.linearVelocity[1], db.inputs.linearVelocity[2]], dtype=np.float64)
+    # --- 実機射出計算 (Kamagata0/shooter_calculator LUT) ---
+    release_vel = None
+    est_distance = 0.0
+    mode_name = "linearVelocity"
+
+    # 1. releaseVelocity 直接指定
+    if hasattr(db.inputs, "releaseVelocity"):
+        try:
+            r_val = float(db.inputs.releaseVelocity)
+            if r_val > 1e-3:
+                release_vel = r_val
+                mode_name = "direct_release_velocity"
+        except Exception:
+            pass
+
+    # 2. outputLevel (1〜10) による実測LUT参照
+    if release_vel is None and hasattr(db.inputs, "outputLevel"):
+        try:
+            lvl = float(db.inputs.outputLevel)
+            if lvl >= 1.0:
+                release_vel, est_distance = get_release_velocity_from_level(lvl)
+                mode_name = f"output_level_{lvl:.1f}"
+        except Exception:
+            pass
+
+    # 3. speedRatio (0.1〜1.0 m/s) による実測LUT参照
+    if release_vel is None and hasattr(db.inputs, "speedRatio"):
+        try:
+            ratio = float(db.inputs.speedRatio)
+            if ratio > 1e-4:
+                release_vel, est_distance = get_release_velocity_from_speed_ratio(ratio)
+                mode_name = f"speed_ratio_{ratio:.2f}"
+        except Exception:
+            pass
+
+    # 射出仰角（実機デフォルト 50.0 deg）
+    launch_angle_deg = DEFAULT_LAUNCH_ANGLE_DEG
+    if hasattr(db.inputs, "launchAngleDeg"):
+        try:
+            a_val = float(db.inputs.launchAngleDeg)
+            if a_val > 0.0:
+                launch_angle_deg = a_val
+        except Exception:
+            pass
+
+    # 従来の linearVelocity の入力確認
+    has_custom_lin_vel = False
+    raw_lin_vel = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    if hasattr(db.inputs, "linearVelocity"):
+        try:
+            raw_lin_vel = np.array([db.inputs.linearVelocity[0], db.inputs.linearVelocity[1], db.inputs.linearVelocity[2]], dtype=np.float64)
+            if np.linalg.norm(raw_lin_vel) > 1e-3:
+                has_custom_lin_vel = True
+        except Exception:
+            pass
+
+    # ローカル初速ベクトルの合成
+    rad = np.radians(launch_angle_deg)
+    if release_vel is not None:
+        if has_custom_lin_vel:
+            # 既存の linearVelocity が向きを持っている場合は、その向きに release_vel の大きさを乗算
+            dir_vec = raw_lin_vel / np.linalg.norm(raw_lin_vel)
+            local_lin_vel = dir_vec * release_vel
+        else:
+            # 射出口のローカル座標系で仰角 launch_angle_deg の初速ベクトルを作成 (+X前方, +Z上方向)
+            local_lin_vel = np.array([np.cos(rad) * release_vel, 0.0, np.sin(rad) * release_vel], dtype=np.float64)
+    else:
+        if has_custom_lin_vel:
+            local_lin_vel = raw_lin_vel
+        else:
+            # フォールバック：デフォルト出力レベル4（約5.95 m/s, 飛距離約4.0m）
+            release_vel, est_distance = get_release_velocity_from_level(4.0)
+            local_lin_vel = np.array([np.cos(rad) * release_vel, 0.0, np.sin(rad) * release_vel], dtype=np.float64)
+            mode_name = "fallback_level_4"
 
     marker_path = state.available.popleft()
     marker_prim = stage.GetPrimAtPath(marker_path)
@@ -216,8 +367,11 @@ def compute(db):
             simulation_mesh.GetVelocitiesAttr().Set(velocities)
 
  # スポーン成功時の処理の最後あたりに追加
+    state.last_launch_time = current_time
+    vel_mag = np.linalg.norm(local_lin_vel)
     world_pos_list = [float(world_pos_np[0]), float(world_pos_np[1]), float(world_pos_np[2])]
     print(f"[ClothLauncher] Spawned {marker_path} at position: {world_pos_list}")
+    print(f"[ClothLauncher] Fired {marker_path}! Mode: {mode_name}, Velocity: {vel_mag:.2f} m/s (Est Dist: {est_distance:.2f}m, Angle: {launch_angle_deg:.1f}deg) at pos: {world_pos_list}")
 
     print(f"Release Prim Found: {bool(release_prim)}, Path: {release_path_str}")
     db.outputs.spawnedPrimPath = marker_path
