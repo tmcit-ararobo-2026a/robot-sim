@@ -702,5 +702,15 @@
     // Use flake8 for linting
     "python.linting.pylintEnabled": false,
     "python.linting.flake8Enabled": true,
-    "python.languageServer": "Pylance"
+    "python.languageServer": "Pylance",
+    "ros.distro": "humble",
+    "ROS2.distro": "humble",
+    "python.autoComplete.extraPaths": [
+        "/home/kamagata/ros2_ws/install/realsense_dust_cloth/local/lib/python3.10/dist-packages",
+        "/home/kamagata/ros2_ws/install/realsense_dust_cloth/lib/python3.10/site-packages",
+        "/home/kamagata/ros2_ws/install/livox_ros_driver2/local/lib/python3.10/dist-packages",
+        "/home/kamagata/ros2_ws/install/lidar_perception_system/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
 }
