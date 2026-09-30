@@ -1,0 +1,5 @@
+
+# VSCode caches
+.vscode/browse.vc.db*
+.vscode/ipch/
+
