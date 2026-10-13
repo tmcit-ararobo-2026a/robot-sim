@@ -23,6 +23,7 @@ def cleanup(db: og.Database):
 def compute(db: og.Database):
     prims = db.inputs.targetPrim
     if not prims:
+        print("[twist_controller] 警告: targetPrim が接続されていません！")
         db.log_warning("targetPrim is not connected")
         return True
 
@@ -33,14 +34,18 @@ def compute(db: og.Database):
 
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        print(f"[twist_controller] 警告: 指定されたprimが無効かRigidBodyがありません: {prim_path}")
         db.log_warning(f"Invalid or non-RigidBody prim: {prim_path}")
         return True
 
+    print(f"[twist_controller] Target: {prim_path}, linear: {db.inputs.linearVelocity}, angular: {db.inputs.angularVelocity}")
+
     rigid_body = UsdPhysics.RigidBodyAPI(prim)
 
-    dt = db.inputs.dt
+    # dtはフィルタで使用されていないため、0以下でも処理をスキップしない
+    dt = getattr(db.inputs, "dt", 0.016)
     if dt <= 0.0:
-        return True
+        dt = 0.016
 
     xform = UsdGeom.Xformable(prim)
     world_transform = xform.ComputeLocalToWorldTransform(0)
@@ -51,7 +56,8 @@ def compute(db: og.Database):
 
     # 移動方向を逆にするため、両方の符号を反転
     vx_target = db.inputs.linearVelocity[0]
-    vy_target = db.inputs.linearVelocity[1]
+    # 横移動（カニ歩き）の向きを反転して正しい方向に修正
+    vy_target = -db.inputs.linearVelocity[1]
     wz_target = -db.inputs.angularVelocity[2]
 
     alpha = 0.15
@@ -70,9 +76,11 @@ def compute(db: og.Database):
     cur_ang_vel = rigid_body.GetAngularVelocityAttr().Get() or Gf.Vec3f(0.0, 0.0, 0.0)
 
     new_lin_vel = Gf.Vec3f(float(dx_world), float(dy_world), cur_lin_vel[2])
-    new_ang_vel = Gf.Vec3f(cur_ang_vel[0], cur_ang_vel[1], float(math.degrees(wz)))
+    # ロール(X)・ピッチ(Y)の回転速度を0にして傾きや転倒を防ぐ
+    new_ang_vel = Gf.Vec3f(0.0, 0.0, float(math.degrees(wz)))
 
     rigid_body.GetVelocityAttr().Set(new_lin_vel)
     rigid_body.GetAngularVelocityAttr().Set(new_ang_vel)
+    print(f"[twist_controller] Velocity適用完了: lin={new_lin_vel}, ang={new_ang_vel}")
 
     return True
