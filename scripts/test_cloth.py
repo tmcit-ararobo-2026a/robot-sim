@@ -131,23 +131,16 @@ def setup(db):
     state.initial_points = {}
     state.last_launch_time = 0.0
 
+    # OmniGraph属性の安全な作成（すでに存在する属性を一覧取得して比較し、存在しない場合のみ作成）
     try:
-        node = db.node
-        if not node.get_attribute("inputs:reset").is_valid():
-            node.create_attribute(
-                "inputs:reset",
-                og.Type(og.BaseDataType.BOOL),
-                custom_user_data="bool input for resetting all cloths",
-                port_type=og.AttributePortType.ATTRIBUTE_PORT_TYPE_INPUT
-            )
+        existing_attrs = {attr.get_name() for attr in db.node.get_attributes()}
     except Exception:
-        pass
-    # OmniGraph属性の安全な作成（存在しない場合のみ作成）
+        existing_attrs = set()
+
     def _ensure_attr(attr_name, base_type, custom_data=""):
         try:
-            node = db.node
-            if not node.get_attribute(attr_name).is_valid():
-                node.create_attribute(
+            if attr_name not in existing_attrs:
+                db.node.create_attribute(
                     attr_name,
                     og.Type(base_type),
                     custom_user_data=custom_data,
@@ -164,13 +157,16 @@ def setup(db):
     _ensure_attr("inputs:releaseVelocity", og.BaseDataType.FLOAT, "Direct release velocity override in m/s")
 
     # --- /World 直下から直接 marker_00 ~ を探索する設定 ---
-    state.root_path = "/World"
-    state.pool_size = int(db.inputs.poolSize)
+    state.pool_size = int(getattr(db.inputs, "poolSize", 10))
 
     for i in range(state.pool_size):
-        path = f"{state.root_path}/marker_{i:02d}"
-        if not is_prim_path_valid(path):
-            db.log_warning(f"[ClothLauncher] World直下に該当するパスが見つかりません: {path}")
+        path = None
+        for candidate in [f"/World/cloth_pool/marker_{i:02d}", f"/World/marker_{i:02d}"]:
+            if is_prim_path_valid(candidate):
+                path = candidate
+                break
+        
+        if not path:
             continue
         
         marker_prim = stage.GetPrimAtPath(path)
@@ -193,8 +189,13 @@ def compute(db):
         stage = omni.usd.get_context().get_stage()
         state.stage = stage
 
+    try:
+        existing_attrs = {attr.get_name() for attr in db.node.get_attributes()}
+    except Exception:
+        existing_attrs = set()
+
     is_reset = False
-    if hasattr(db.inputs, "reset"):
+    if "inputs:reset" in existing_attrs:
         is_reset = bool(db.inputs.reset)
 
     if is_reset:
@@ -207,13 +208,15 @@ def compute(db):
             db.log_warning(f"[ClothLauncher] Could not reset input attribute: {e}")
         return True
 
-    if hasattr(db.inputs, "execIn") and not db.inputs.execIn:
+    if "inputs:execIn" in existing_attrs and not db.inputs.execIn:
         return True
+
+    print(f"[ClothLauncher] 発射トリガー受信！ 射出処理を開始します...")
 
     # --- クールダウン処理（連射制限） ---
     current_time = time.time()
     cooldown = 0.5
-    if hasattr(db.inputs, "cooldownTime"):
+    if "inputs:cooldownTime" in existing_attrs:
         try:
             c_val = float(db.inputs.cooldownTime)
             if c_val > 0.0:
@@ -225,15 +228,43 @@ def compute(db):
         return True
 
     if not hasattr(state, "available") or not state.available:
-        db.log_warning("[ClothLauncher] pool exhausted!")
-        return True
+        # プール内の雑巾をすべて撃ち尽くした場合、または未初期化の場合は自動リロード
+        if not getattr(state, "initial_transforms", None):
+            state.initial_transforms = {}
+            state.initial_points = {}
+            for i in range(10):
+                for base in ["/World", "/World/cloth_pool"]:
+                    p = f"{base}/marker_{i:02d}"
+                    if is_prim_path_valid(p) and p not in state.initial_transforms:
+                        prim = stage.GetPrimAtPath(p)
+                        xf = UsdGeom.Xformable(prim)
+                        state.initial_transforms[p] = xf.GetLocalTransformation(Usd.TimeCode.Default())
+                        s_mesh = stage.GetPrimAtPath(f"{p}/simulation_mesh")
+                        if s_mesh:
+                            state.initial_points[p] = UsdGeom.Mesh(s_mesh).GetPointsAttr().Get()
+        
+        _reset_all_markers(state, stage)
+        print(f"[ClothLauncher] プール内の雑巾を自動リロードしました（装填数: {len(state.available)}枚）")
+        
+        if not state.available:
+            db.log_warning("[ClothLauncher] pool exhausted (リセット可能なmarkerが見つかりません)")
+            return True
 
     release_path_str = _extract_prim_path_string(db.inputs.releasePointPrim)
-    if not release_path_str:
-        return True
-
-    release_prim = stage.GetPrimAtPath(release_path_str)
+    release_prim = None
+    if release_path_str and is_prim_path_valid(release_path_str):
+        release_prim = stage.GetPrimAtPath(release_path_str)
+    
     if not release_prim:
+        # /World/robot/release_point が見つからない場合の自動代替探索
+        for candidate in ["/World/release_point", "/World/base_link/release_point", "/World/base_link"]:
+            if is_prim_path_valid(candidate):
+                release_prim = stage.GetPrimAtPath(candidate)
+                print(f"[ClothLauncher] releasePointPrimが見つからないため、代替として {candidate} から射出します")
+                break
+
+    if not release_prim:
+        print(f"[ClothLauncher] エラー: 射出原点 (releasePointPrim: {release_path_str}) がStage上に見つかりません！")
         return True
 
     local_lin_vel = np.array([db.inputs.linearVelocity[0], db.inputs.linearVelocity[1], db.inputs.linearVelocity[2]], dtype=np.float64)
@@ -243,7 +274,7 @@ def compute(db):
     mode_name = "linearVelocity"
 
     # 1. releaseVelocity 直接指定
-    if hasattr(db.inputs, "releaseVelocity"):
+    if "inputs:releaseVelocity" in existing_attrs:
         try:
             r_val = float(db.inputs.releaseVelocity)
             if r_val > 1e-3:
@@ -253,7 +284,7 @@ def compute(db):
             pass
 
     # 2. outputLevel (1〜10) による実測LUT参照
-    if release_vel is None and hasattr(db.inputs, "outputLevel"):
+    if release_vel is None and "inputs:outputLevel" in existing_attrs:
         try:
             lvl = float(db.inputs.outputLevel)
             if lvl >= 1.0:
@@ -263,7 +294,7 @@ def compute(db):
             pass
 
     # 3. speedRatio (0.1〜1.0 m/s) による実測LUT参照
-    if release_vel is None and hasattr(db.inputs, "speedRatio"):
+    if release_vel is None and "inputs:speedRatio" in existing_attrs:
         try:
             ratio = float(db.inputs.speedRatio)
             if ratio > 1e-4:
@@ -274,7 +305,7 @@ def compute(db):
 
     # 射出仰角（実機デフォルト 50.0 deg）
     launch_angle_deg = DEFAULT_LAUNCH_ANGLE_DEG
-    if hasattr(db.inputs, "launchAngleDeg"):
+    if "inputs:launchAngleDeg" in existing_attrs:
         try:
             a_val = float(db.inputs.launchAngleDeg)
             if a_val > 0.0:
@@ -285,7 +316,7 @@ def compute(db):
     # 従来の linearVelocity の入力確認
     has_custom_lin_vel = False
     raw_lin_vel = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-    if hasattr(db.inputs, "linearVelocity"):
+    if "inputs:linearVelocity" in existing_attrs:
         try:
             raw_lin_vel = np.array([db.inputs.linearVelocity[0], db.inputs.linearVelocity[1], db.inputs.linearVelocity[2]], dtype=np.float64)
             if np.linalg.norm(raw_lin_vel) > 1e-3:
