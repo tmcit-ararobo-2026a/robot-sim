@@ -1,7 +1,8 @@
 # ClothLauncher Script Node (World直下・起動時完全非表示対応版)
-# ClothLauncher Script Node (実機ベルト直動式射出機構・実測LUT対応版)
+# ClothLauncher Script Node (実機ベルト直動式射出機構・実測LUT & ROS2雑巾解析逆算初速対応版)
 import numpy as np
 import time
+import socket
 from collections import deque
 from pxr import Usd, UsdGeom, Gf, Vt, Sdf
 from isaacsim.core.utils.prims import is_prim_path_valid
@@ -155,6 +156,32 @@ def setup(db):
     _ensure_attr("inputs:launchAngleDeg", og.BaseDataType.FLOAT, "Shooter launch angle in degrees (default 50.0)")
     _ensure_attr("inputs:cooldownTime", og.BaseDataType.FLOAT, "Cooldown interval between launches in seconds")
     _ensure_attr("inputs:releaseVelocity", og.BaseDataType.FLOAT, "Direct release velocity override in m/s")
+    _ensure_attr("inputs:recommendedSpeed", og.BaseDataType.FLOAT, "Recommended speed from cloth analysis in m/s")
+    _ensure_attr("inputs:useRecommendedSpeed", og.BaseDataType.BOOL, "Prioritize recommendedSpeed over LUT (default True)")
+    _ensure_attr("inputs:simUdpPort", og.BaseDataType.INT, "UDP port for automatic sync with cloth_analysis_node (default 9876)")
+
+    # UDP Direct Link (ROS 2 cloth_analysis_node との自動連携)
+    state.udp_recommended_speed = None
+    state.udp_recommended_vec = None
+    state.udp_launch_angle = None
+    state.udp_sock = None
+    try:
+        udp_port = 9876
+        if "inputs:simUdpPort" in existing_attrs:
+            try:
+                p_val = int(db.inputs.simUdpPort)
+                if p_val > 0:
+                    udp_port = p_val
+            except Exception:
+                pass
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", udp_port))
+        sock.setblocking(False)
+        state.udp_sock = sock
+        print(f"[ClothLauncher] UDP Direct Link 有効化 (0.0.0.0:{udp_port}) - cloth_analysis_node からの推奨初速を自動受信します")
+    except Exception as e:
+        print(f"[ClothLauncher] UDP Direct Link 初期化スキップ/例外: {e}")
 
     # --- /World 直下から直接 marker_00 ~ を探索する設定 ---
     state.pool_size = int(getattr(db.inputs, "poolSize", 10))
@@ -213,6 +240,25 @@ def compute(db):
 
     print(f"[ClothLauncher] 発射トリガー受信！ 射出処理を開始します...")
 
+    # --- UDP Direct Link: cloth_analysis_node からの最新逆算速度の受信 ---
+    if getattr(state, "udp_sock", None) is not None:
+        while True:
+            try:
+                data, _ = state.udp_sock.recvfrom(512)
+                if data:
+                    text = data.decode("utf-8").strip()
+                    parts = [float(p) for p in text.split(",")]
+                    if len(parts) >= 1:
+                        state.udp_recommended_speed = parts[0]
+                    if len(parts) >= 4:
+                        state.udp_recommended_vec = np.array([parts[1], parts[2], parts[3]], dtype=np.float64)
+                    if len(parts) >= 5:
+                        state.udp_launch_angle = parts[4]
+            except BlockingIOError:
+                break
+            except Exception:
+                break
+
     # --- クールダウン処理（連射制限） ---
     current_time = time.time()
     cooldown = 0.5
@@ -268,12 +314,19 @@ def compute(db):
         return True
 
     local_lin_vel = np.array([db.inputs.linearVelocity[0], db.inputs.linearVelocity[1], db.inputs.linearVelocity[2]], dtype=np.float64)
-    # --- 実機射出計算 (Kamagata0/shooter_calculator LUT) ---
+    # --- 実機射出計算 (Kamagata0/shooter_calculator LUT & 雑巾解析逆算初速) ---
     release_vel = None
     est_distance = 0.0
     mode_name = "linearVelocity"
 
-    # 1. releaseVelocity 直接指定
+    use_recommended = True
+    if "inputs:useRecommendedSpeed" in existing_attrs:
+        try:
+            use_recommended = bool(db.inputs.useRecommendedSpeed)
+        except Exception:
+            pass
+
+    # 1. releaseVelocity 直接指定（Action Graph 手動オーバーライド最優先）
     if "inputs:releaseVelocity" in existing_attrs:
         try:
             r_val = float(db.inputs.releaseVelocity)
@@ -283,7 +336,25 @@ def compute(db):
         except Exception:
             pass
 
-    # 2. outputLevel (1〜10) による実測LUT参照
+    # 2. recommendedSpeed（Action Graph 結線経由の解析逆算初速）
+    if release_vel is None and use_recommended and "inputs:recommendedSpeed" in existing_attrs:
+        try:
+            rec_val = float(db.inputs.recommendedSpeed)
+            if rec_val > 0.05:
+                release_vel = rec_val
+                mode_name = "og_recommended_speed"
+        except Exception:
+            pass
+
+    # 3. UDP Direct Link（ROS 2 cloth_analysis_node からの自動受信初速）
+    if release_vel is None and use_recommended and getattr(state, "udp_recommended_speed", None) is not None:
+        if state.udp_recommended_speed > 0.05:
+            release_vel = float(state.udp_recommended_speed)
+            mode_name = "udp_auto_analysis_node"
+            if getattr(state, "udp_launch_angle", None) is not None:
+                launch_angle_deg = float(state.udp_launch_angle)
+
+    # 4. outputLevel (1〜10) による実測LUT参照
     if release_vel is None and "inputs:outputLevel" in existing_attrs:
         try:
             lvl = float(db.inputs.outputLevel)
@@ -293,7 +364,7 @@ def compute(db):
         except Exception:
             pass
 
-    # 3. speedRatio (0.1〜1.0 m/s) による実測LUT参照
+    # 5. speedRatio (0.1〜1.0 m/s) による実測LUT参照
     if release_vel is None and "inputs:speedRatio" in existing_attrs:
         try:
             ratio = float(db.inputs.speedRatio)
@@ -408,3 +479,12 @@ def compute(db):
     db.outputs.spawnedPrimPath = marker_path
     db.outputs.execOut = True
     return True
+
+def cleanup(db):
+    state = getattr(db, "internal_state", None)
+    if state and getattr(state, "udp_sock", None) is not None:
+        try:
+            state.udp_sock.close()
+            state.udp_sock = None
+        except Exception:
+            pass
